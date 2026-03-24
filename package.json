@@ -1,0 +1,16 @@
+{
+  "name": "fire-emblem-poc-bot",
+  "version": "0.1.0",
+  "description": "Discord proof-of-concept tactical battle bot",
+  "main": "src/bot.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/bot.js",
+    "check": "node --check src/bot.js"
+  },
+  "dependencies": {
+    "canvas": "^2.11.2",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
+  }
+}
