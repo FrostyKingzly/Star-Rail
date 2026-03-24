@@ -21,6 +21,7 @@ const GRID_ROWS = 8;
 const GRID_COLS = 8;
 const CELL_SIZE = 100;
 const GRID_PADDING = 60;
+const ENEMY_MOV = 4;
 
 const PLAYER_STATS = {
   Alear: { level: 1, class: 'Dragon Child', hp: 22, str: 6, mag: 0, dex: 5, spd: 7, def: 5, res: 3, lck: 5, bld: 4, mov: 4 },
@@ -44,6 +45,10 @@ const ENEMY_IMAGE_FILES = [
 ];
 
 const PLAYER_ORDER = ['Alear', 'Vander', 'Clanne', 'Framme'];
+const PHASES = {
+  PLAYER: 'player',
+  ENEMY: 'enemy',
+};
 const PLAYER_STARTS = {
   Alear: toPos('1A'),
   Vander: toPos('1B'),
@@ -123,6 +128,11 @@ async function handleBattleButton(interaction, battle) {
   }
 
   if (action === 'open-move') {
+    if (battle.phase !== PHASES.PLAYER) {
+      await interaction.reply({ content: 'You can only move player units during the Player Phase.', ephemeral: true });
+      return;
+    }
+
     if (battle.turn.movedThisTurn.length >= PLAYER_ORDER.length) {
       await interaction.reply({ content: 'All allies have already moved this turn.', ephemeral: true });
       return;
@@ -149,6 +159,11 @@ async function handleBattleButton(interaction, battle) {
   }
 
   if (action === 'choose') {
+    if (battle.phase !== PHASES.PLAYER) {
+      await interaction.reply({ content: 'You can only move player units during the Player Phase.', ephemeral: true });
+      return;
+    }
+
     if (!PLAYER_ORDER.includes(value)) {
       await interaction.reply({ content: 'Unknown character.', ephemeral: true });
       return;
@@ -167,8 +182,23 @@ async function handleBattleButton(interaction, battle) {
   }
 
   if (action === 'step') {
+    if (battle.phase !== PHASES.PLAYER) {
+      await interaction.reply({ content: 'Movement input is only allowed during the Player Phase.', ephemeral: true });
+      return;
+    }
+
     if (!battle.turn.selectedUnit || !battle.turn.previewPos) {
       await interaction.reply({ content: 'Pick a character first from Move.', ephemeral: true });
+      return;
+    }
+
+    const selected = battle.allies[battle.turn.selectedUnit];
+    const movementLimit = selected.stats.mov;
+    if (battle.turn.previewPath.length >= movementLimit) {
+      await interaction.reply({
+        content: `${battle.turn.selectedUnit} can only move up to ${movementLimit} tiles this turn.`,
+        ephemeral: true,
+      });
       return;
     }
 
@@ -183,12 +213,18 @@ async function handleBattleButton(interaction, battle) {
       return;
     }
 
+    battle.turn.previewPath.push(value);
     battle.turn.previewPos = candidate;
     await interaction.update(buildMovementPrompt(battle, `${battle.turn.selectedUnit} preview: ${fromPos(candidate)}`));
     return;
   }
 
   if (action === 'confirm') {
+    if (battle.phase !== PHASES.PLAYER) {
+      await interaction.reply({ content: 'Confirming movement is only allowed during the Player Phase.', ephemeral: true });
+      return;
+    }
+
     const unitName = battle.turn.selectedUnit;
     if (!unitName || !battle.turn.previewPos) {
       await interaction.reply({ content: 'Pick a character first from Move.', ephemeral: true });
@@ -199,6 +235,12 @@ async function handleBattleButton(interaction, battle) {
     battle.turn.movedThisTurn.push(unitName);
     battle.turn.selectedUnit = null;
     battle.turn.previewPos = null;
+    battle.turn.previewPath = [];
+
+    if (hasAllPlayersMoved(battle)) {
+      await transitionToEnemyPhase(interaction, battle, `${unitName} moved. All player units have acted.`);
+      return;
+    }
 
     const { embed, attachment, components } = await buildBattleResponse(battle);
     await interaction.update({
@@ -209,11 +251,47 @@ async function handleBattleButton(interaction, battle) {
     });
     return;
   }
+
+  if (action === 'open-end') {
+    if (battle.phase !== PHASES.PLAYER) {
+      await interaction.reply({ content: 'You can only end the turn during the Player Phase.', ephemeral: true });
+      return;
+    }
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('battle:confirm-end:yes').setLabel('Confirm End').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId('battle:cancel-end:no').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+    );
+
+    await interaction.reply({
+      content: 'Are you sure you want to end the Player Phase now?',
+      components: [row],
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (action === 'cancel-end') {
+    await interaction.update({ content: 'Player Phase continues.', components: [] });
+    return;
+  }
+
+  if (action === 'confirm-end') {
+    if (battle.phase !== PHASES.PLAYER) {
+      await interaction.update({ content: 'The battle is no longer in Player Phase.', components: [] });
+      return;
+    }
+
+    await transitionToEnemyPhase(interaction, battle, 'Player Phase ended manually.');
+    return;
+  }
 }
 
 function buildMovementPrompt(battle, message) {
   const selected = battle.turn.selectedUnit;
   const preview = battle.turn.previewPos ? fromPos(battle.turn.previewPos) : 'N/A';
+  const movementLimit = selected ? battle.allies[selected].stats.mov : 0;
+  const movementUsed = battle.turn.previewPath.length;
 
   const movementButtons = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('battle:step:left').setLabel('Left').setStyle(ButtonStyle.Secondary),
@@ -224,7 +302,9 @@ function buildMovementPrompt(battle, message) {
   );
 
   return {
-    content: `${message}\nSelected: **${selected ?? 'None'}**\nPreview tile: **${preview}**`,
+    content:
+      `${message}\nSelected: **${selected ?? 'None'}**\nPreview tile: **${preview}**\n` +
+      `Movement used: **${movementUsed}/${movementLimit}**`,
     components: [movementButtons],
     embeds: [],
     files: [],
@@ -265,7 +345,9 @@ function createBattleState(ownerId, imageCache) {
       movedThisTurn: [],
       selectedUnit: null,
       previewPos: null,
+      previewPath: [],
     },
+    phase: PHASES.PLAYER,
   };
 }
 
@@ -277,20 +359,28 @@ async function buildBattleResponse(battle) {
     ? battle.turn.movedThisTurn.join(', ')
     : 'None yet';
 
+  const isPlayerPhase = battle.phase === PHASES.PLAYER;
   const embed = new EmbedBuilder()
     .setTitle('Fire Emblem POC Battle')
     .setDescription(
-      `Allies start at 1A, 1B, 2A, 2B. Enemies are in the opposite corner.\n` +
+      `Phase: **${isPlayerPhase ? 'PLAYER PHASE' : 'ENEMY PHASE'}**\n` +
+        `Allies start at 1A, 1B, 2A, 2B. Enemies are in the opposite corner.\n` +
         `Moved this turn: **${movedList}**`,
     )
     .setImage('attachment://battle-map.png')
-    .setColor(0x4c8f3d);
+    .setColor(isPlayerPhase ? 0x2b8cff : 0xff3a3a);
 
   const moveRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('battle:open-move:menu')
       .setLabel('Move')
-      .setStyle(ButtonStyle.Primary),
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(!isPlayerPhase || hasAllPlayersMoved(battle)),
+    new ButtonBuilder()
+      .setCustomId('battle:open-end:turn')
+      .setLabel('End')
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(!isPlayerPhase),
   );
 
   return {
@@ -409,6 +499,87 @@ function isOccupiedByAnyUnit(battle, candidate, movingUnitName) {
   }
 
   for (const enemy of battle.enemies) {
+    if (enemy.pos.row === candidate.row && enemy.pos.col === candidate.col) return true;
+  }
+
+  return false;
+}
+
+function hasAllPlayersMoved(battle) {
+  return battle.turn.movedThisTurn.length >= PLAYER_ORDER.length;
+}
+
+function buildPhaseTransitionEmbed(phase) {
+  if (phase === PHASES.ENEMY) {
+    return new EmbedBuilder().setTitle('ENEMY PHASE').setColor(0xff3a3a);
+  }
+
+  return new EmbedBuilder().setTitle('PLAYER PHASE').setColor(0x2b8cff);
+}
+
+async function transitionToEnemyPhase(interaction, battle, statusMessage) {
+  battle.phase = PHASES.ENEMY;
+  battle.turn.selectedUnit = null;
+  battle.turn.previewPos = null;
+  battle.turn.previewPath = [];
+
+  const { embed, attachment, components } = await buildBattleResponse(battle);
+  await interaction.update({
+    content: statusMessage,
+    embeds: [embed, buildPhaseTransitionEmbed(PHASES.ENEMY)],
+    files: [attachment],
+    components,
+  });
+
+  runEnemyPhase(battle);
+
+  battle.phase = PHASES.PLAYER;
+  battle.turn.movedThisTurn = [];
+  battle.turn.selectedUnit = null;
+  battle.turn.previewPos = null;
+  battle.turn.previewPath = [];
+
+  const nextState = await buildBattleResponse(battle);
+  await interaction.followUp({
+    content: 'Enemy units moved. Player Phase begins.',
+    embeds: [nextState.embed, buildPhaseTransitionEmbed(PHASES.PLAYER)],
+    files: [nextState.attachment],
+    components: nextState.components,
+  });
+}
+
+function runEnemyPhase(battle) {
+  const directions = ['left', 'up', 'right', 'down'];
+
+  for (const enemy of battle.enemies) {
+    for (let step = 0; step < ENEMY_MOV; step += 1) {
+      const options = shuffleDirections(directions).map((direction) => nextStep(enemy.pos, direction));
+      const nextTile = options.find((candidate) => isInsideGrid(candidate) && !isOccupiedByEnemyStep(battle, candidate, enemy.id));
+      if (!nextTile) {
+        break;
+      }
+      enemy.pos = nextTile;
+    }
+  }
+}
+
+function shuffleDirections(directions) {
+  const copy = [...directions];
+  for (let i = copy.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
+}
+
+function isOccupiedByEnemyStep(battle, candidate, movingEnemyId) {
+  for (const name of PLAYER_ORDER) {
+    const pos = battle.allies[name].pos;
+    if (pos.row === candidate.row && pos.col === candidate.col) return true;
+  }
+
+  for (const enemy of battle.enemies) {
+    if (enemy.id === movingEnemyId) continue;
     if (enemy.pos.row === candidate.row && enemy.pos.col === candidate.col) return true;
   }
 
